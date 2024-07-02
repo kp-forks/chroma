@@ -15,6 +15,7 @@ mod sysdb;
 mod system;
 mod tracing;
 mod types;
+mod utils;
 
 use config::Configurable;
 use memberlist::MemberlistProvider;
@@ -60,7 +61,7 @@ pub async fn query_service_entrypoint() {
         }
     };
     worker_server.set_system(system.clone());
-    worker_server.set_dispatcher(dispatcher_handle.receiver());
+    worker_server.set_dispatcher(dispatcher_handle.clone());
 
     let server_join_handle = tokio::spawn(async move {
         let _ = crate::server::WorkerServer::run(worker_server).await;
@@ -79,11 +80,6 @@ pub async fn query_service_entrypoint() {
         // Kubernetes will send SIGTERM to stop the pod gracefully
         // TODO: add more signal handling
         _ = sigterm.recv() => {
-            server_join_handle.abort();
-            match server_join_handle.await {
-                Ok(_) => println!("Server stopped"),
-                Err(e) => println!("Server stopped with error {}", e),
-            }
             dispatcher_handle.stop();
             dispatcher_handle.join().await;
             system.stop().await;
@@ -138,7 +134,7 @@ pub async fn compaction_service_entrypoint() {
                 return;
             }
         };
-    compaction_manager.set_dispatcher(dispatcher_handle.receiver());
+    compaction_manager.set_dispatcher(dispatcher_handle.clone());
     compaction_manager.set_system(system.clone());
 
     let mut compaction_manager_handle = system.start_component(compaction_manager);

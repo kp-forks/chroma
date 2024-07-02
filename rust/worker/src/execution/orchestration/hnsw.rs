@@ -1,12 +1,17 @@
 use super::super::operator::{wrap, TaskMessage};
 use super::super::operators::pull_log::{PullLogsInput, PullLogsOperator};
+use super::common::{
+    get_collection_by_id, get_hnsw_segment_by_id, get_record_segment_by_collection_id,
+};
 use crate::blockstore::provider::BlockfileProvider;
 use crate::distance::DistanceFunction;
 use crate::errors::{ChromaError, ErrorCodes};
 use crate::execution::data::data_chunk::Chunk;
+use crate::execution::dispatcher::Dispatcher;
 use crate::execution::operator::TaskResult;
 use crate::execution::operators::brute_force_knn::{
-    BruteForceKnnOperator, BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput,
+    BruteForceKnnOperator, BruteForceKnnOperatorError, BruteForceKnnOperatorInput,
+    BruteForceKnnOperatorOutput,
 };
 use crate::execution::operators::hnsw_knn::{
     HnswKnnOperator, HnswKnnOperatorInput, HnswKnnOperatorOutput,
@@ -14,6 +19,7 @@ use crate::execution::operators::hnsw_knn::{
 use crate::execution::operators::merge_knn_results::{
     MergeKnnResultsOperator, MergeKnnResultsOperatorInput, MergeKnnResultsOperatorOutput,
 };
+use crate::execution::operators::normalize_vectors::normalize;
 use crate::execution::operators::pull_log::PullLogsOutput;
 use crate::index::hnsw_provider::HnswIndexProvider;
 use crate::index::IndexConfig;
@@ -22,11 +28,11 @@ use crate::segment::distributed_hnsw_segment::{
     DistributedHNSWSegmentFromSegmentError, DistributedHNSWSegmentReader,
 };
 use crate::sysdb::sysdb::{GetCollectionsError, GetSegmentsError, SysDb};
-use crate::system::{ComponentContext, System};
+use crate::system::{ComponentContext, ComponentHandle, System};
 use crate::types::{Collection, LogRecord, Segment, SegmentType, VectorQueryResult};
 use crate::{
     log::log::Log,
-    system::{Component, Handler, Receiver},
+    system::{Component, Handler, ReceiverForMessage},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -64,8 +70,8 @@ enum ExecutionState {
 
 #[derive(Error, Debug)]
 enum HnswSegmentQueryError {
-    #[error("Hnsw segment with id: {0} not found")]
-    HnswSegmentNotFound(Uuid),
+    #[error(transparent)]
+    HnswSegmentQueryError(#[from] super::common::GetHnswSegmentByIdError),
     #[error("Get segments error")]
     GetSegmentsError(#[from] GetSegmentsError),
     #[error("Collection: {0} not found")]
@@ -83,7 +89,7 @@ enum HnswSegmentQueryError {
 impl ChromaError for HnswSegmentQueryError {
     fn code(&self) -> ErrorCodes {
         match self {
-            HnswSegmentQueryError::HnswSegmentNotFound(_) => ErrorCodes::NotFound,
+            HnswSegmentQueryError::HnswSegmentQueryError(e) => e.code(),
             HnswSegmentQueryError::GetSegmentsError(_) => ErrorCodes::Internal,
             HnswSegmentQueryError::CollectionNotFound(_) => ErrorCodes::NotFound,
             HnswSegmentQueryError::GetCollectionError(_) => ErrorCodes::Internal,
@@ -103,6 +109,8 @@ pub(crate) struct HnswQueryOrchestrator {
     query_vectors: Vec<Vec<f32>>,
     k: i32,
     allowed_ids: Arc<[String]>,
+    allowed_ids_hnsw_segment: Arc<[String]>,
+    allowed_ids_brute_force: Arc<[String]>,
     include_embeddings: bool,
     hnsw_segment_id: Uuid,
     // State fetched or created for query execution
@@ -126,9 +134,9 @@ pub(crate) struct HnswQueryOrchestrator {
     merge_dependency_count: u32,
     finish_dependency_count: u32,
     // Services
-    log: Box<dyn Log>,
-    sysdb: Box<dyn SysDb>,
-    dispatcher: Box<dyn Receiver<TaskMessage>>,
+    log: Box<Log>,
+    sysdb: Box<SysDb>,
+    dispatcher: ComponentHandle<Dispatcher>,
     hnsw_index_provider: HnswIndexProvider,
     blockfile_provider: BlockfileProvider,
     // Result channel
@@ -145,11 +153,11 @@ impl HnswQueryOrchestrator {
         allowed_ids: Vec<String>,
         include_embeddings: bool,
         segment_id: Uuid,
-        log: Box<dyn Log>,
-        sysdb: Box<dyn SysDb>,
+        log: Box<Log>,
+        sysdb: Box<SysDb>,
         hnsw_index_provider: HnswIndexProvider,
         blockfile_provider: BlockfileProvider,
-        dispatcher: Box<dyn Receiver<TaskMessage>>,
+        dispatcher: ComponentHandle<Dispatcher>,
     ) -> Self {
         // Set the merge dependency count to the number of query vectors * 2
         // N for the HNSW query and N for the Brute force query
@@ -159,6 +167,12 @@ impl HnswQueryOrchestrator {
         let finish_dependency_count = query_vectors.len() as u32;
         // pre-allocate the result vectors
         let results = Some(Vec::with_capacity(query_vectors.len()));
+        tracing::info!(
+            "Performing KNN for k = {}, allowed_ids = {:?}, num query vectors = {:?}",
+            k,
+            allowed_ids,
+            query_vectors.len()
+        );
 
         HnswQueryOrchestrator {
             state: ExecutionState::Pending,
@@ -168,6 +182,8 @@ impl HnswQueryOrchestrator {
             query_vectors,
             k,
             allowed_ids: allowed_ids.into(),
+            allowed_ids_brute_force: Arc::new([]),
+            allowed_ids_hnsw_segment: Arc::new([]),
             include_embeddings,
             hnsw_segment_id: segment_id,
             hnsw_segment: None,
@@ -194,7 +210,7 @@ impl HnswQueryOrchestrator {
 
     async fn pull_logs(
         &mut self,
-        self_address: Box<dyn Receiver<TaskResult<PullLogsOutput, PullLogsError>>>,
+        self_address: Box<dyn ReceiverForMessage<TaskResult<PullLogsOutput, PullLogsError>>>,
     ) {
         self.state = ExecutionState::PullLogs;
         let operator = PullLogsOperator::new(self.log.clone());
@@ -235,7 +251,11 @@ impl HnswQueryOrchestrator {
     async fn brute_force_query(
         &mut self,
         logs: Chunk<LogRecord>,
-        self_address: Box<dyn Receiver<TaskResult<BruteForceKnnOperatorOutput, ()>>>,
+        self_address: Box<
+            dyn ReceiverForMessage<
+                TaskResult<BruteForceKnnOperatorOutput, BruteForceKnnOperatorError>,
+            >,
+        >,
     ) {
         self.state = ExecutionState::QueryKnn;
         let distance_function = &self
@@ -247,10 +267,18 @@ impl HnswQueryOrchestrator {
         // TODO: We shouldn't have to clone query vectors here. We should be able to pass a Arc<[f32]>-like to the input
         for (i, query_vector) in self.query_vectors.iter().enumerate() {
             let bf_input = BruteForceKnnOperatorInput {
-                data: logs.clone(),
+                log: logs.clone(),
                 query: query_vector.clone(),
                 k: self.k as usize,
                 distance_metric: distance_function.clone(),
+                allowed_ids: self.allowed_ids.clone(),
+                allowed_ids_brute_force: self.allowed_ids_brute_force.clone(),
+                record_segment_definition: self
+                    .record_segment
+                    .as_ref()
+                    .expect("Invariant violation. Record segment is not set")
+                    .clone(),
+                blockfile_provider: self.blockfile_provider.clone(),
             };
             let operator = Box::new(BruteForceKnnOperator {});
             let task = wrap(operator, bf_input, self_address.clone());
@@ -289,22 +317,26 @@ impl HnswQueryOrchestrator {
         .await
         {
             Ok(reader) => reader,
-            Err(e) => match *e {
-                DistributedHNSWSegmentFromSegmentError::Uninitialized => {
-                    // no task, decrement the merge dependency count and return
-                    // with an empty result
-                    for (i, _) in self.query_vectors.iter().enumerate() {
-                        self.merge_dependency_count -= 1;
-                        self.hnsw_result_distances.insert(i, Vec::new());
-                        self.hnsw_result_offset_ids.insert(i, Vec::new());
+            Err(e) => {
+                match *e {
+                    DistributedHNSWSegmentFromSegmentError::Uninitialized => {
+                        tracing::error!("[HnswQueryOperation]: Error creating distributed hnsw segment reader {:?}", *e);
+                        // no task, decrement the merge dependency count and return
+                        // with an empty result
+                        for (i, _) in self.query_vectors.iter().enumerate() {
+                            self.merge_dependency_count -= 1;
+                            self.hnsw_result_distances.insert(i, Vec::new());
+                            self.hnsw_result_offset_ids.insert(i, Vec::new());
+                        }
+                        return;
                     }
-                    return;
+                    _ => {
+                        tracing::error!("[HnswQueryOperation]: Error creating distributed hnsw segment reader {:?}", *e);
+                        self.terminate_with_error(e, ctx);
+                        return;
+                    }
                 }
-                _ => {
-                    self.terminate_with_error(e, ctx);
-                    return;
-                }
-            },
+            }
         };
         println!("Created HNSW Segment Reader: {:?}", hnsw_segment_reader);
 
@@ -323,9 +355,10 @@ impl HnswQueryOrchestrator {
                 record_segment: record_segment.clone(),
                 blockfile_provider: self.blockfile_provider.clone(),
                 allowed_ids: self.allowed_ids.clone(),
+                allowed_ids_hnsw: self.allowed_ids_hnsw_segment.clone(),
                 logs: logs.clone(),
             };
-            let task = wrap(operator, input, ctx.sender.as_receiver());
+            let task = wrap(operator, input, ctx.receiver());
             self.hnsw_task_id_to_query_index.insert(task.id(), i);
             match self.dispatcher.send(task, Some(Span::current())).await {
                 Ok(_) => (),
@@ -374,6 +407,12 @@ impl HnswQueryOrchestrator {
             .brute_force_result_embeddings
             .remove(&query_vector_index);
 
+        tracing::info!(
+            "[HnswQueryOperation]: Brute force {} user ids, hnsw {} offset ids",
+            brute_force_result_user_ids.len(),
+            hnsw_result_offset_ids.len()
+        );
+
         let operator = Box::new(MergeKnnResultsOperator {});
         let input = MergeKnnResultsOperatorInput::new(
             hnsw_result_offset_ids,
@@ -387,7 +426,7 @@ impl HnswQueryOrchestrator {
             self.blockfile_provider.clone(),
         );
 
-        let task = wrap(operator, input, ctx.sender.as_receiver());
+        let task = wrap(operator, input, ctx.receiver());
         self.merge_task_id_to_query_index
             .insert(task.id(), query_vector_index);
         match self.dispatcher.send(task, Some(Span::current())).await {
@@ -399,96 +438,26 @@ impl HnswQueryOrchestrator {
         }
     }
 
-    async fn get_hnsw_segment_from_id(
-        &self,
-        mut sysdb: Box<dyn SysDb>,
-        hnsw_segment_id: &Uuid,
-    ) -> Result<Segment, Box<dyn ChromaError>> {
-        let segments = sysdb
-            .get_segments(Some(*hnsw_segment_id), None, None, None)
-            .await;
-        let segment = match segments {
-            Ok(segments) => {
-                if segments.is_empty() {
-                    return Err(Box::new(HnswSegmentQueryError::HnswSegmentNotFound(
-                        *hnsw_segment_id,
-                    )));
-                }
-                segments[0].clone()
-            }
-            Err(e) => {
-                return Err(Box::new(HnswSegmentQueryError::GetSegmentsError(e)));
-            }
-        };
-
-        if segment.r#type != SegmentType::HnswDistributed {
-            return Err(Box::new(HnswSegmentQueryError::HnswSegmentNotFound(
-                *hnsw_segment_id,
-            )));
+    fn terminate_with_empty_response(&mut self, ctx: &ComponentContext<Self>) {
+        let result_channel = self
+            .result_channel
+            .take()
+            .expect("Invariant violation. Result channel is not set.");
+        let mut empty_resp = vec![];
+        for _ in 0..self.query_vectors.len() {
+            empty_resp.push(vec![]);
         }
-        Ok(segment)
-    }
-
-    async fn get_collection(
-        &self,
-        mut sysdb: Box<dyn SysDb>,
-        collection_id: &Uuid,
-    ) -> Result<Collection, Box<dyn ChromaError>> {
-        let child_span: tracing::Span =
-            trace_span!(parent: Span::current(), "get collection for collection id");
-        let collections = sysdb
-            .get_collections(Some(*collection_id), None, None, None)
-            .instrument(child_span.clone())
-            .await;
-        match collections {
-            Ok(mut collections) => {
-                if collections.is_empty() {
-                    return Err(Box::new(HnswSegmentQueryError::CollectionNotFound(
-                        *collection_id,
-                    )));
-                }
-                Ok(collections.drain(..).next().unwrap())
-            }
+        match result_channel.send(Ok(empty_resp)) {
+            Ok(_) => (),
             Err(e) => {
-                return Err(Box::new(HnswSegmentQueryError::GetCollectionError(e)));
+                // Log an error - this implied the listener was dropped
+                tracing::error!(
+                    "[HnswQueryOrchestrator] Result channel dropped before sending empty response"
+                );
             }
         }
-    }
-
-    async fn get_record_segment_for_collection(
-        &self,
-        mut sysdb: Box<dyn SysDb>,
-        collection_id: &Uuid,
-    ) -> Result<Segment, Box<dyn ChromaError>> {
-        let segments = sysdb
-            .get_segments(
-                None,
-                Some(SegmentType::Record.into()),
-                None,
-                Some(*collection_id),
-            )
-            .await;
-
-        let segment = match segments {
-            Ok(mut segments) => {
-                if segments.is_empty() {
-                    return Err(Box::new(HnswSegmentQueryError::RecordSegmentNotFound(
-                        *collection_id,
-                    )));
-                }
-                segments.drain(..).next().unwrap()
-            }
-            Err(e) => {
-                return Err(Box::new(HnswSegmentQueryError::GetSegmentsError(e)));
-            }
-        };
-
-        if segment.r#type != SegmentType::Record {
-            return Err(Box::new(HnswSegmentQueryError::RecordSegmentNotFound(
-                *collection_id,
-            )));
-        }
-        Ok(segment)
+        // Cancel the orchestrator so it stops processing
+        ctx.cancellation_token.cancel();
     }
 
     fn terminate_with_error(&mut self, error: Box<dyn ChromaError>, ctx: &ComponentContext<Self>) {
@@ -535,16 +504,14 @@ impl Component for HnswQueryOrchestrator {
 
     async fn on_start(&mut self, ctx: &crate::system::ComponentContext<Self>) -> () {
         // Populate the orchestrator with the initial state - The HNSW Segment, The Record Segment and the Collection
-        let hnsw_segment = match self
-            .get_hnsw_segment_from_id(self.sysdb.clone(), &self.hnsw_segment_id)
-            .await
-        {
-            Ok(segment) => segment,
-            Err(e) => {
-                self.terminate_with_error(e, ctx);
-                return;
-            }
-        };
+        let hnsw_segment =
+            match get_hnsw_segment_by_id(self.sysdb.clone(), &self.hnsw_segment_id).await {
+                Ok(segment) => segment,
+                Err(e) => {
+                    self.terminate_with_error(e, ctx);
+                    return;
+                }
+            };
 
         let collection_id = match &hnsw_segment.collection {
             Some(collection_id) => collection_id,
@@ -557,13 +524,20 @@ impl Component for HnswQueryOrchestrator {
             }
         };
 
-        let collection = match self.get_collection(self.sysdb.clone(), collection_id).await {
+        let collection = match get_collection_by_id(self.sysdb.clone(), collection_id).await {
             Ok(collection) => collection,
             Err(e) => {
                 self.terminate_with_error(e, ctx);
                 return;
             }
         };
+
+        // If segment is uninitialized and dimension is not set then we assume
+        // that this is a query before any add so return empty response.
+        if hnsw_segment.file_path.len() <= 0 && collection.dimension.is_none() {
+            self.terminate_with_empty_response(ctx);
+            return;
+        }
 
         // Validate that the collection has a dimension set. Downstream steps will rely on this
         // so that they can unwrap the dimension without checking for None
@@ -575,20 +549,26 @@ impl Component for HnswQueryOrchestrator {
             return;
         };
 
-        let record_segment = match self
-            .get_record_segment_for_collection(self.sysdb.clone(), collection_id)
-            .await
-        {
-            Ok(segment) => segment,
-            Err(e) => {
-                self.terminate_with_error(e, ctx);
-                return;
-            }
-        };
+        let record_segment =
+            match get_record_segment_by_collection_id(self.sysdb.clone(), collection_id).await {
+                Ok(segment) => segment,
+                Err(e) => {
+                    self.terminate_with_error(e, ctx);
+                    return;
+                }
+            };
 
         match IndexConfig::from_segment(&hnsw_segment, collection.dimension.unwrap()) {
             Ok(index_config) => {
                 self.index_config = Some(index_config);
+
+                // Normalize the query vectors if we are using the cosine similarity
+                if self.index_config.as_ref().unwrap().distance_function == DistanceFunction::Cosine
+                {
+                    for query_vector in self.query_vectors.iter_mut() {
+                        *query_vector = normalize(query_vector);
+                    }
+                }
             }
             Err(e) => {
                 self.terminate_with_error(e, ctx);
@@ -600,7 +580,7 @@ impl Component for HnswQueryOrchestrator {
         self.hnsw_segment = Some(hnsw_segment);
         self.collection = Some(collection);
 
-        self.pull_logs(ctx.sender.as_receiver()).await;
+        self.pull_logs(ctx.receiver()).await;
     }
 }
 
@@ -619,8 +599,26 @@ impl Handler<TaskResult<PullLogsOutput, PullLogsError>> for HnswQueryOrchestrato
         match message {
             Ok(pull_logs_output) => {
                 let logs = pull_logs_output.logs();
-                self.brute_force_query(logs.clone(), ctx.sender.as_receiver())
-                    .await;
+                // Divide the allowed_ids into two mutually exclusive lists
+                // one for the brute force and another for the hnsw segment query.
+                let mut allowed_ids_hnsw = vec![];
+                let mut allowed_ids_brute_force = vec![];
+                for id in self.allowed_ids.iter() {
+                    let mut found_in_log = false;
+                    for (log, _) in logs.iter() {
+                        if id == &log.record.id {
+                            found_in_log = true;
+                            allowed_ids_brute_force.push(id.clone());
+                            break;
+                        }
+                    }
+                    if !found_in_log {
+                        allowed_ids_hnsw.push(id.clone());
+                    }
+                }
+                self.allowed_ids_brute_force = allowed_ids_brute_force.into();
+                self.allowed_ids_hnsw_segment = allowed_ids_hnsw.into();
+                self.brute_force_query(logs.clone(), ctx.receiver()).await;
                 self.hnsw_segment_query(logs, ctx).await;
             }
             Err(e) => {
@@ -631,10 +629,12 @@ impl Handler<TaskResult<PullLogsOutput, PullLogsError>> for HnswQueryOrchestrato
 }
 
 #[async_trait]
-impl Handler<TaskResult<BruteForceKnnOperatorOutput, ()>> for HnswQueryOrchestrator {
+impl Handler<TaskResult<BruteForceKnnOperatorOutput, BruteForceKnnOperatorError>>
+    for HnswQueryOrchestrator
+{
     async fn handle(
         &mut self,
-        message: TaskResult<BruteForceKnnOperatorOutput, ()>,
+        message: TaskResult<BruteForceKnnOperatorOutput, BruteForceKnnOperatorError>,
         ctx: &crate::system::ComponentContext<HnswQueryOrchestrator>,
     ) {
         let task_id = message.id();
@@ -646,30 +646,10 @@ impl Handler<TaskResult<BruteForceKnnOperatorOutput, ()>> for HnswQueryOrchestra
 
         match message {
             Ok(output) => {
-                let mut user_ids = Vec::new();
+                let mut user_ids = output.user_ids;
                 let mut embeddings = None;
                 if self.include_embeddings {
-                    embeddings = Some(Vec::new());
-                }
-                for index in output.indices {
-                    let record = match output.data.get(index) {
-                        Some(record) => record,
-                        None => {
-                            // return an error
-                            return;
-                        }
-                    };
-                    user_ids.push(record.record.id.clone());
-                    if let Some(embeddings) = embeddings.as_mut() {
-                        embeddings.push(
-                            record
-                                .record
-                                .embedding
-                                .as_ref()
-                                .expect("Brute force result log record should have embedding set")
-                                .clone(),
-                        );
-                    }
+                    embeddings = Some(output.embeddings);
                 }
                 self.brute_force_result_user_ids
                     .insert(query_index, user_ids);
@@ -706,7 +686,6 @@ impl Handler<TaskResult<HnswKnnOperatorOutput, Box<dyn ChromaError>>> for HnswQu
             .hnsw_task_id_to_query_index
             .remove(&task_id)
             .expect("Invariant violation. HNSW task id is not set for query vector index");
-
         match message {
             Ok(output) => {
                 self.hnsw_result_offset_ids

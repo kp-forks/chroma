@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Optional, cast
 from hypothesis import given, settings, HealthCheck
 import pytest
 from chromadb.api import ServerAPI
@@ -14,15 +14,24 @@ from chromadb.api.types import (
     Where,
     WhereDocument,
 )
+from chromadb.test.conftest import reset, NOT_CLUSTER_ONLY
 import chromadb.test.property.strategies as strategies
 import hypothesis.strategies as st
 import logging
 import random
 import re
+from chromadb.test.utils.wait_for_version_increase import wait_for_version_increase
 
 
-def _filter_where_clause(clause: Where, metadata: Metadata) -> bool:
+def _filter_where_clause(clause: Where, metadata: Optional[Metadata]) -> bool:
     """Return true if the where clause is true for the given metadata map"""
+    if metadata is None:
+        # None metadata does not match any clause
+        # Note: This includes cases where filtering for $ne or $nin
+        # as we require that the key is present in the metadata
+        # i.e for a record set of [{}, {}] and a filter of {"where": {"test": {"$ne": 1}}}
+        # the result should be [] as the key "test" is not present in the metadata
+        return False
 
     key, expr = list(clause.items())[0]
 
@@ -167,34 +176,47 @@ recordset_st = st.shared(
 
 
 @settings(
+    deadline=90000,
     suppress_health_check=[
         HealthCheck.function_scoped_fixture,
         HealthCheck.large_base_example,
-    ]
+        HealthCheck.filter_too_much,
+    ],
 )  # type: ignore
 @given(
     collection=collection_st,
     record_set=recordset_st,
     filters=st.lists(strategies.filters(collection_st, recordset_st), min_size=1),
+    should_compact=st.booleans(),
 )
 def test_filterable_metadata_get(
-    caplog, api: ServerAPI, collection: strategies.Collection, record_set, filters
+    caplog,
+    api: ServerAPI,
+    collection: strategies.Collection,
+    record_set,
+    filters,
+    should_compact: bool,
 ) -> None:
     caplog.set_level(logging.ERROR)
 
-    api.reset()
+    reset(api)
     coll = api.create_collection(
         name=collection.name,
         metadata=collection.metadata,  # type: ignore
         embedding_function=collection.embedding_function,
     )
 
-    if not invariants.is_metadata_valid(invariants.wrap_all(record_set)):
-        with pytest.raises(Exception):
-            coll.add(**record_set)
-        return
+    initial_version = coll.get_model()["version"]
 
     coll.add(**record_set)
+
+    if not NOT_CLUSTER_ONLY:
+        # Only wait for compaction if the size of the collection is
+        # some minimal size
+        if should_compact and len(invariants.wrap(record_set["ids"])) > 10:
+            # Wait for the model to be updated
+            wait_for_version_increase(api, collection.name, initial_version)
+
     for filter in filters:
         result_ids = coll.get(**filter)["ids"]
         expected_ids = _filter_embedding_set(record_set, filter)
@@ -202,10 +224,12 @@ def test_filterable_metadata_get(
 
 
 @settings(
+    deadline=90000,
     suppress_health_check=[
         HealthCheck.function_scoped_fixture,
         HealthCheck.large_base_example,
-    ]
+        HealthCheck.filter_too_much,
+    ],
 )  # type: ignore
 @given(
     collection=collection_st,
@@ -213,6 +237,7 @@ def test_filterable_metadata_get(
     filters=st.lists(strategies.filters(collection_st, recordset_st), min_size=1),
     limit=st.integers(min_value=1, max_value=10),
     offset=st.integers(min_value=0, max_value=10),
+    should_compact=st.booleans(),
 )
 def test_filterable_metadata_get_limit_offset(
     caplog,
@@ -222,22 +247,33 @@ def test_filterable_metadata_get_limit_offset(
     filters,
     limit,
     offset,
+    should_compact: bool,
 ) -> None:
     caplog.set_level(logging.ERROR)
 
-    api.reset()
+    # The distributed system does not support limit/offset yet
+    # so we skip this test for now if the system is distributed
+    if not NOT_CLUSTER_ONLY:
+        pytest.skip("Distributed system does not support limit/offset yet")
+
+    reset(api)
     coll = api.create_collection(
         name=collection.name,
         metadata=collection.metadata,  # type: ignore
         embedding_function=collection.embedding_function,
     )
 
-    if not invariants.is_metadata_valid(invariants.wrap_all(record_set)):
-        with pytest.raises(Exception):
-            coll.add(**record_set)
-        return
+    initial_version = coll.get_model()["version"]
 
     coll.add(**record_set)
+
+    if not NOT_CLUSTER_ONLY:
+        # Only wait for compaction if the size of the collection is
+        # some minimal size
+        if should_compact and len(invariants.wrap(record_set["ids"])) > 10:
+            # Wait for the model to be updated
+            wait_for_version_increase(api, collection.name, initial_version)
+
     for filter in filters:
         # add limit and offset to filter
         filter["limit"] = limit
@@ -248,10 +284,12 @@ def test_filterable_metadata_get_limit_offset(
 
 
 @settings(
+    deadline=90000,
     suppress_health_check=[
         HealthCheck.function_scoped_fixture,
         HealthCheck.large_base_example,
-    ]
+        HealthCheck.filter_too_much,
+    ],
 )
 @given(
     collection=collection_st,
@@ -260,6 +298,7 @@ def test_filterable_metadata_get_limit_offset(
         strategies.filters(collection_st, recordset_st, include_all_ids=True),
         min_size=1,
     ),
+    should_compact=st.booleans(),
 )
 def test_filterable_metadata_query(
     caplog: pytest.LogCaptureFixture,
@@ -267,23 +306,28 @@ def test_filterable_metadata_query(
     collection: strategies.Collection,
     record_set: strategies.RecordSet,
     filters: List[strategies.Filter],
+    should_compact: bool,
 ) -> None:
     caplog.set_level(logging.ERROR)
 
-    api.reset()
+    reset(api)
     coll = api.create_collection(
         name=collection.name,
         metadata=collection.metadata,  # type: ignore
         embedding_function=collection.embedding_function,
     )
+    initial_version = coll.get_model()["version"]
     normalized_record_set = invariants.wrap_all(record_set)
 
-    if not invariants.is_metadata_valid(normalized_record_set):
-        with pytest.raises(Exception):
-            coll.add(**record_set)
-        return
-
     coll.add(**record_set)
+
+    if not NOT_CLUSTER_ONLY:
+        # Only wait for compaction if the size of the collection is
+        # some minimal size
+        if should_compact and len(invariants.wrap(record_set["ids"])) > 10:
+            # Wait for the model to be updated
+            wait_for_version_increase(api, collection.name, initial_version)
+
     total_count = len(normalized_record_set["ids"])
     # Pick a random vector
     random_query: Embedding
@@ -318,7 +362,7 @@ def test_filterable_metadata_query(
 
 def test_empty_filter(api: ServerAPI) -> None:
     """Test that a filter where no document matches returns an empty result"""
-    api.reset()
+    reset(api)
     coll = api.create_collection(name="test")
 
     test_ids: IDs = ["1", "2", "3"]
@@ -354,7 +398,7 @@ def test_empty_filter(api: ServerAPI) -> None:
 
 def test_boolean_metadata(api: ServerAPI) -> None:
     """Test that metadata with boolean values is correctly filtered"""
-    api.reset()
+    reset(api)
     coll = api.create_collection(name="test")
 
     test_ids: IDs = ["1", "2", "3"]
@@ -371,7 +415,7 @@ def test_boolean_metadata(api: ServerAPI) -> None:
 def test_get_empty(api: ServerAPI) -> None:
     """Tests that calling get() with empty filters returns nothing"""
 
-    api.reset()
+    reset(api)
     coll = api.create_collection(name="test")
 
     test_ids: IDs = ["1", "2", "3"]
